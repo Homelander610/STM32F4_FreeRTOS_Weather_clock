@@ -1,0 +1,706 @@
+// ==========================================
+// --- main.c ---
+// ==========================================
+#include <stdio.h>
+#include <stdint.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "board.h"
+#include "page.h"
+#include "wifi.h"
+#include "app.h"
+#include "ui.h"
+#include "workqueue.h"
+
+static void main_init(void *pararm)
+{
+	board_init();
+
+	ui_init();
+
+	welcome_page_display();
+
+	wifi_init();
+	wifi_page_display();
+	wifi_wait_connect();
+
+	main_page_display();
+	app_init();
+
+	vTaskDelete(NULL);
+}
+
+int main(void)
+{
+	board_lowlevel_init();
+	workqueue_init();
+
+	xTaskCreate(main_init, "init", 1024, NULL, 9, NULL);
+
+	vTaskStartScheduler();
+
+	while (1)
+	{
+		; // code should not run here
+	}
+}
+
+// ==========================================
+// --- app.c ---
+// ==========================================
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "board.h"
+#include "page.h"
+#include "app.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "workqueue.h"
+#include "timers.h"
+#include "esp_at.h"
+#include "rtc.h"
+#include "weather.h"
+#include "aht20.h"
+#include <math.h>
+
+#define MILLISECONDS(x) (x)
+#define SECONDS(x) MILLISECONDS((x) * 1000UL)
+#define MINUTES(x) SECONDS((x) * 60)
+#define HOURS(x) MINUTES((x) * 60)
+#define DAYS(x) HOURS((x) * 24)
+
+#define TIME_SYNC_INTERVAL HOURS(1)
+#define WIFI_UPDATE_INTERVAL SECONDS(5)
+#define TIME_UPDATE_INTERVAL SECONDS(1)
+#define INNER_UPDATE_INTERVAL SECONDS(3)
+#define OUTDOOR_UPDATE_INTERVAL MINUTES(1)
+
+static TimerHandle_t time_sync_timer;
+static TimerHandle_t wifi_update_timer;
+static TimerHandle_t time_update_timer;
+static TimerHandle_t inner_update_timer;
+static TimerHandle_t outdoor_update_timer;
+
+static void time_sync(void)
+{
+	uint32_t restart_sync_delay = TIME_SYNC_INTERVAL;
+	rtc_date_time_t rtc_date = {0};
+	esp_date_time_t esp_date = {0};
+	if (!esp_at_sntp_get_time(&esp_date))
+	{
+		printf("[SNTP] get time failed\n");
+		restart_sync_delay = SECONDS(1);
+		goto err;
+	}
+	if (esp_date.year < 2000)
+	{
+		printf("[SNTP] invalid date format\n");
+		restart_sync_delay = SECONDS(1);
+		goto err;
+	}
+	printf("[SNTP] %04u-%02u-%02u %02u:%02u:%02u (%d)\n", esp_date.year, esp_date.month, esp_date.day, esp_date.hour, esp_date.minute, esp_date.second, esp_date.weekday);
+
+	rtc_date.year = esp_date.year;
+	rtc_date.month = esp_date.month;
+	rtc_date.day = esp_date.day;
+	rtc_date.hour = esp_date.hour;
+	rtc_date.minute = esp_date.minute;
+	rtc_date.second = esp_date.second;
+	rtc_date.weekday = esp_date.weekday;
+	rtc_set_time(&rtc_date);
+
+err:
+	xTimerChangePeriod(time_sync_timer, pdMS_TO_TICKS(restart_sync_delay), 0);
+}
+static void wifi_update(void)
+{
+	static esp_wifi_info_t last_info = {0};
+
+	esp_wifi_info_t info = {0};
+	if (!esp_at_get_wifi_info(&info))
+	{
+		printf("[AT] wifi get info failed\n");
+		return;
+	}
+	if (memcmp(&info, &last_info, sizeof(esp_wifi_info_t)) == 0) // 比较一个info比较，如果一样则不更新wifi连接一样的则更新
+		return;
+
+	// 只在连接状态改变时 才触发UI和串口打印
+	if (last_info.connected != info.connected)
+	{
+		if (info.connected)
+		{
+			printf("[WIFI] connected to %s\n", info.ssid);
+			printf("[WIFI] SSID: %s, BSSID: %s, Channel: %d, RSSI: %d\n", info.ssid, info.bssid, info.channel, info.rssi);
+			main_page_redraw_wifi_ssid(info.ssid);
+		}
+		else
+		{
+			printf("[WIFI] disconnected from %s\n", last_info.ssid);
+			main_page_redraw_wifi_ssid("wifi lost");
+		}
+	}
+	// 更新历史信息
+	memcpy(&last_info, &info, sizeof(esp_wifi_info_t));
+}
+static void time_update(void)
+{
+	static rtc_date_time_t last_date = {0};
+
+	rtc_date_time_t date = {0};
+	rtc_get_time(&date);
+
+	if (date.year < 2020)
+		return;
+
+	if (memcmp(&date, &last_date, sizeof(rtc_date_time_t)) == 0)
+		return;
+
+	memcpy(&last_date, &date, sizeof(rtc_date_time_t));
+	printf("[TIME] Updating display: %02d:%02d:%02d\n", date.hour, date.minute, date.second);
+	main_page_redraw_time(&date);
+	main_page_redraw_date(&date);
+}
+static void inner_update(void)
+{
+	static float last_temperature, last_humidity;
+
+	if (!aht20_start_measurement())
+	{
+		printf("[AHT20] start measurement failed\n");
+		return;
+	}
+	if (!aht20_wait_for_measurement())
+	{
+		printf("[AHT20] wait for measurement failed\n");
+		return;
+	}
+
+	float temperature = 0.0f, humidity = 0.0f;
+
+	if (!aht20_read_measurement(&temperature, &humidity))
+	{
+		printf("[AHT20] read measurement failed\n");
+		return;
+	}
+
+	if ((fabs(last_temperature - temperature) < 0.1f) && (fabs(last_humidity - humidity) < 0.1f))
+		return;
+
+	last_temperature = temperature;
+	last_humidity = humidity;
+
+	printf("[AHT20] Temperature: %.1f, Humidity: %.1f\n", temperature, humidity);
+	main_page_redraw_inner_temperature(temperature);
+	main_page_redraw_inner_humidity(humidity);
+}
+static void outdoor_update(void)
+{
+	static weather_info_t last_weather = {0};
+	weather_info_t weather = {0};
+	uint32_t next_check_interval = MINUTES(10);
+
+	// 原有的请求网络连接逻辑步骤
+	const char *weather_url = "https://api.seniverse.com/v3/weather/now.json?key=SEc2YmJCa39zrYSV4&location=WQJ6YY8MHZP0&language=en&unit=c";
+	const char *weather_http_response = esp_at_http_get(weather_url);
+
+	if (weather_http_response == NULL)
+	{
+		printf("[WEATHER] http error\n");
+		goto end;
+	}
+
+	if (!parse_seniverse_response(weather_http_response, &weather))
+	{
+		printf("[WEATHER] parse failed\n");
+		goto end;
+	}
+
+	if (memcmp(&last_weather, &weather, sizeof(weather_info_t)) == 0)
+	{
+		goto end;
+	}
+
+	memcpy(&last_weather, &weather, sizeof(weather_info_t));
+	printf("[WEATHER] %s, %s, %.1f\n", weather.city, weather.weather, weather.temperature);
+
+	main_page_redraw_outdoor_temperature(weather.temperature);
+	main_page_redraw_outdoor_weather_icon(weather.weather_code);
+
+end:
+	xTimerChangePeriod(outdoor_update_timer, pdMS_TO_TICKS(next_check_interval), 0);
+}
+
+typedef void (*app_job_t)(void);
+
+static void app_work(void *param)
+{
+	app_job_t job = (app_job_t)param;
+	job();
+}
+
+static void work_timer_cb(TimerHandle_t timer)
+{
+	app_job_t job = (app_job_t)pvTimerGetTimerID(timer);
+	workqueue_run(app_work, job);
+}
+static void app_timer_cb(TimerHandle_t timer)
+{
+	app_job_t job = (app_job_t)pvTimerGetTimerID(timer);
+	job();
+}
+
+void app_init(void)
+{
+	/**
+	 * 在 FreeRTOS 中，所有的软件定时器回调函数都在一个叫做 TmrSvc (Timer Service) 的系统后台任务中执行的。这个任务是一个任务，因此可以执行任何阻塞或非阻塞的代码，包括Block的延时函数，而不会阻塞系统其他任务的运行
+	 */
+	// 时间更新只需要去RTC的寄存器读取值 不需要延时操作 所以可以直接在系统定时器回调中执行
+	time_update_timer = xTimerCreate("time update", pdMS_TO_TICKS(TIME_UPDATE_INTERVAL), pdTRUE, (void *)time_update, app_timer_cb);
+
+	// 以下的几个任务都涉及AT 串口指令交互等待 HTTP 响应等待 I2C 湿度传感器转换等延时操作，并且内部有 xSemaphoreTake 循环等待 所以都交给工作队列执行
+	wifi_update_timer = xTimerCreate("wifi update", pdMS_TO_TICKS(WIFI_UPDATE_INTERVAL), pdTRUE, (void *)wifi_update, work_timer_cb);
+	inner_update_timer = xTimerCreate("inner update", pdMS_TO_TICKS(INNER_UPDATE_INTERVAL), pdTRUE, (void *)inner_update, work_timer_cb);
+
+	// 这两个任务也都一样需要同步也需要异步，根据本地硬件传感器稳定性和外部网络稳定性需要有不同的执行策略，根据本地执行结果动态变化
+	// 时间同步定时器模式设置为->一次性定时器/可自动重载
+	// 天气更新的定时器模式设置为->一次性定时器/可自动重载
+	time_sync_timer = xTimerCreate("time sync", pdMS_TO_TICKS(TIME_SYNC_INTERVAL), pdFALSE, (void *)time_sync, work_timer_cb);
+	outdoor_update_timer = xTimerCreate("outdoor update", pdMS_TO_TICKS(OUTDOOR_UPDATE_INTERVAL), pdFALSE, (void *)outdoor_update, work_timer_cb);
+
+	xTimerStart(time_update_timer, 0);
+	xTimerStart(wifi_update_timer, 0);
+	xTimerStart(inner_update_timer, 0);
+
+	workqueue_run(app_work, (void *)time_sync);
+	workqueue_run(app_work, (void *)wifi_update);
+	workqueue_run(app_work, (void *)inner_update);
+	workqueue_run(app_work, (void *)outdoor_update);
+}
+
+// ==========================================
+// --- ui.c ---
+// ==========================================
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "st7789.h"
+#include "ui.h"
+#include "font.h"
+#include "image.h"
+
+typedef enum
+{
+	UI_ACTION_FILL_COLOR,
+	UI_ACTION_WRITE_STRING,
+	UI_ACTION_DRAW_IMAGE
+} ui_action_t;
+
+typedef struct
+{
+	ui_action_t action;
+	union
+	{
+		struct
+		{
+			uint16_t x;
+			uint16_t y;
+			uint16_t width;
+			uint16_t height;
+			uint16_t color;
+		} fill_color;
+		struct
+		{
+			uint16_t x;
+			uint16_t y;
+			const char *str;
+			uint16_t color;
+			uint16_t bg_color;
+			const font_t *font;
+		} write_string;
+		struct
+		{
+			uint16_t x;
+			uint16_t y;
+			const image_t *image;
+		} draw_image;
+	} message_union;
+} ui_message_t;
+
+static QueueHandle_t ui_queue;
+
+static void ui_func(void *param)
+{
+	ui_message_t msg;
+
+	st7789_init();
+
+	while (1)
+	{
+		xQueueReceive(ui_queue, &msg, portMAX_DELAY);
+
+		switch (msg.action)
+		{
+		case UI_ACTION_FILL_COLOR:
+			st7789_fill_color(msg.message_union.fill_color.x,
+							  msg.message_union.fill_color.y,
+							  msg.message_union.fill_color.width,
+							  msg.message_union.fill_color.height,
+							  msg.message_union.fill_color.color);
+			break;
+		case UI_ACTION_WRITE_STRING:
+			st7789_write_string(msg.message_union.write_string.x,
+								msg.message_union.write_string.y,
+								msg.message_union.write_string.str,
+								msg.message_union.write_string.color,
+								msg.message_union.write_string.bg_color,
+								msg.message_union.write_string.font);
+			vPortFree((void *)msg.message_union.write_string.str);
+			break;
+		case UI_ACTION_DRAW_IMAGE:
+			st7789_draw_image(msg.message_union.draw_image.x,
+							  msg.message_union.draw_image.y,
+							  msg.message_union.draw_image.image);
+			break;
+		default:
+			printf("Unknown UI action: %d\n", msg.action);
+			break;
+		}
+	}
+}
+
+void ui_init(void)
+{
+	ui_queue = xQueueCreate(16, sizeof(ui_message_t)); // 创建一个能缓存16个msg的队列，每个消息大小为sizeof(ui_message_t)
+	configASSERT(ui_queue);
+	xTaskCreate(ui_func, "ui", 1024, NULL, 8, NULL);
+}
+void ui_fill_color(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t color)
+{
+	ui_message_t msg;
+	msg.action = UI_ACTION_FILL_COLOR;
+	msg.message_union.fill_color.x = x;
+	msg.message_union.fill_color.y = y;
+	msg.message_union.fill_color.width = width;
+	msg.message_union.fill_color.height = height;
+	msg.message_union.fill_color.color = color;
+
+	xQueueSend(ui_queue, &msg, portMAX_DELAY);
+}
+void ui_write_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg_color, const font_t *font)
+{
+	char *pstr = pvPortMalloc(strlen(str) + 1);
+	if (pstr == NULL)
+	{
+		printf("ui write string malloc failed: %s\n", str);
+		return;
+	}
+	strcpy(pstr, str);
+
+	ui_message_t msg;
+	msg.action = UI_ACTION_WRITE_STRING;
+	msg.message_union.write_string.x = x;
+	msg.message_union.write_string.y = y;
+	msg.message_union.write_string.str = pstr;
+	msg.message_union.write_string.color = color;
+	msg.message_union.write_string.bg_color = bg_color;
+	msg.message_union.write_string.font = font;
+
+	xQueueSend(ui_queue, &msg, portMAX_DELAY);
+}
+void ui_draw_image(uint16_t x, uint16_t y, const image_t *image)
+{
+	ui_message_t msg;
+	msg.action = UI_ACTION_DRAW_IMAGE;
+	msg.message_union.draw_image.x = x;
+	msg.message_union.draw_image.y = y;
+	msg.message_union.draw_image.image = image;
+
+	xQueueSend(ui_queue, &msg, portMAX_DELAY);
+}
+
+// ==========================================
+// --- board.c ---
+// ==========================================
+#include <stdio.h>
+#include <stdint.h>
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "board.h"
+#include "console.h"
+#include "esp_at.h"
+#include "weather.h"
+#include "aht20.h"
+#include "rtc.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+//板级时钟
+void board_lowlevel_init(void)
+{
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOA,ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB,ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOD,ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1,ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3,ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_SPI2,ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1, ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_PWR, ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_DMA1,ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_DMA2,ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM6, ENABLE);
+
+	PWR_BackupAccessCmd(ENABLE);	//使能后备区域的访问 包括RTC实时时钟 LSE低速外部时钟 数据寄存器 (备份寄存器需要提前开启)
+	RCC_LSEConfig(RCC_LSE_ON);	//开启LSE LSE通过连接一个32.768kHz的晶振2的15次方分频得到1Hz的RTC时钟
+	while(RCC_GetFlagStatus(RCC_FLAG_LSERDY) == RESET);
+	RCC_RTCCLKConfig(RCC_RTCCLKSource_LSE);
+}
+
+//板级设备初始化
+void board_init(void)
+{
+	tim_delay_init();
+	rtc_init();
+	console_init();
+	aht20_init();
+}
+
+//重定向 printf 到 USART1
+int fputc(int ch, FILE *f)
+{
+	while(USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+	USART_SendData(USART1, (uint8_t)ch);
+	return ch;
+}
+void vAssertCalled(const char *file, int line)
+{
+	portDISABLE_INTERRUPTS();
+    printf("Assert Called: %s(%d)\n", file, line);
+}
+
+void vApplicationStackOverflowHook( TaskHandle_t xTask, char *pcTaskName)
+{
+    printf("Stack Overflowed: %s\n", pcTaskName);
+    configASSERT(0);
+}
+
+void vApplicationMallocFailedHook( void )
+{
+    printf("Malloc Failed\n");
+    configASSERT(0);
+}
+
+// ==========================================
+// --- page/welcome_page.c ---
+// ==========================================
+#include <stdio.h>
+#include "ui.h"
+
+void welcome_page_display(void)
+{
+	const uint16_t color_bg = mkcolor(0, 0, 0);
+	ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, color_bg);
+	ui_draw_image(30, 10, &image_meihua);
+	ui_write_string(40, 205, "嵌入式时钟", mkcolor(237, 128, 147), color_bg, &font32_maple_bold);
+	ui_write_string(56, 233, "天气时钟", mkcolor(86, 165, 255), color_bg, &font32_maple_bold);
+	ui_write_string(60, 285, "loading...", mkcolor(255, 255, 255), color_bg, &font24_maple_bold);
+}
+
+// ==========================================
+// --- page/wifi_page.c ---
+// ==========================================
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include "ui.h"
+#include "wifi.h"
+
+void wifi_page_display(void)
+{
+	const char *ssid = WIFI_SSID;
+	int ssid_len = strlen(ssid) * font20_maple_bold.size / 2;
+	uint16_t ssid_startx = 0;
+	if (ssid_len < UI_WIDTH)
+	{
+		ssid_startx = (UI_WIDTH - ssid_len) / 2;
+	}
+
+	const uint16_t color_bg = mkcolor(0, 0, 0);
+	ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, color_bg);
+	ui_draw_image(30, 15, &image_wifi);
+	ui_write_string(88, 191, "WIFI", mkcolor(0, 255, 234), color_bg, &font32_maple_bold);
+	ui_write_string(ssid_startx, 233, ssid, mkcolor(255, 255, 255), color_bg, &font20_maple_bold);
+	ui_write_string(84, 263, "连接中", mkcolor(148, 198, 255), color_bg, &font24_maple_bold);
+}
+
+// ==========================================
+// --- page/error_page.c ---
+// ==========================================
+#include <stdio.h>
+#include <string.h>
+#include "ui.h"
+
+
+void error_page_display(const char *msg)
+{
+	const uint16_t color_bg = mkcolor(0,0,0);
+	ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, color_bg);
+	ui_draw_image(40, 37, &image_error);
+
+	uint16_t startx = 0;
+	int len = strlen(msg) * font20_maple_bold.size / 2;		//这里只考虑英文字符
+	if(len < UI_WIDTH)
+	{
+		startx = (UI_WIDTH - len) / 2;
+	}
+
+	ui_write_string(startx, 245, msg, mkcolor(255,255,0),color_bg, &font20_maple_bold);
+
+}
+
+// ==========================================
+// --- page/main_page.c ---
+// ==========================================
+#include <stdio.h>
+#include <string.h>
+#include "ui.h"
+#include "wifi.h"
+#include "esp_at.h"
+#include "page.h"
+#include "rtc.h"
+
+static const uint16_t color_bg_time = mkcolor(248, 248, 248);	// 模块1的背景色
+static const uint16_t color_bg_inner = mkcolor(136, 217, 234);	// 模块2的背景色
+static const uint16_t color_bg_outdoor = mkcolor(254, 135, 75); // 模块3的背景色
+
+void main_page_display(void)
+{
+	ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, mkcolor(0, 0, 0));
+	// 第一个模块
+	do
+	{
+		ui_fill_color(15, 15, 224, 154, color_bg_time);
+		// wifi
+		ui_draw_image(23, 20, &image_icon_wifi);
+		// ssid
+		main_page_redraw_wifi_ssid(WIFI_SSID);
+		// 时间
+		ui_write_string(25, 42, "--:--", mkcolor(0, 0, 0), color_bg_time, &font76_maple_bold);
+		// 日期
+		ui_write_string(35, 121, "----/--/-- 星期--", mkcolor(143, 143, 143), color_bg_time, &font20_maple_bold);
+	} while (0);
+
+	// 第二个模块
+	do
+	{
+		ui_fill_color(15, 165, 114, 304, color_bg_inner);
+		ui_write_string(19, 170, "室内温度", mkcolor(0, 0, 0), color_bg_inner, &font24_maple_bold);
+		ui_write_string(86, 190, "C", mkcolor(0, 0, 0), color_bg_inner, &font32_maple_bold);
+		ui_write_string(91, 262, "%", mkcolor(0, 0, 0), color_bg_inner, &font32_maple_bold);
+		main_page_redraw_inner_temperature(999.9f);
+		main_page_redraw_inner_humidity(999.9f);
+	} while (0);
+
+	// 第三个模块
+	do
+	{
+		ui_fill_color(125, 165, 224, 304, color_bg_outdoor);
+		ui_draw_image(139, 248, &image_wenduji);
+		ui_write_string(192, 190, "C", mkcolor(0, 0, 0), color_bg_outdoor, &font32_maple_bold);
+		main_page_redraw_outdoor_weather_icon(-1);
+		main_page_redraw_outdoor_city("北京");
+		main_page_redraw_outdoor_temperature(999.9f);
+
+	} while (0);
+}
+// 动态绘制ssid的函数
+void main_page_redraw_wifi_ssid(const char *ssid)
+{
+	char str[21];
+	snprintf(str, 21, "%20s", ssid);
+	ui_write_string(50, 23, str, mkcolor(143, 143, 143), color_bg_time, &font16_maple_bold);
+}
+
+// 动态绘制时间的函数
+void main_page_redraw_time(rtc_date_time_t *time)
+{
+	char str[6];
+	char comma = (time->second % 2 == 0) ? ':' : ' ';
+	snprintf(str, sizeof(str), "%02u%c%02u", time->hour, comma, time->minute);
+	ui_write_string(25, 42, str, mkcolor(0, 0, 0), color_bg_time, &font76_maple_bold);
+}
+// 动态绘制日期的函数
+void main_page_redraw_date(rtc_date_time_t *date)
+{
+	char str[18];
+	snprintf(str, sizeof(str), "%04u/%02u/%02u 星期%s", date->year, date->month, date->day,
+			 date->weekday == 1 ? "一" : date->weekday == 2 ? "二"
+								 : date->weekday == 3	? "三"
+								 : date->weekday == 4	? "四"
+								 : date->weekday == 5	? "五"
+								 : date->weekday == 6	? "六"
+								 : date->weekday == 7	? "日"
+													: "X");
+	ui_write_string(35, 121, str, mkcolor(143, 143, 143), color_bg_time, &font20_maple_bold);
+}
+
+// 动态绘制温湿度
+void main_page_redraw_inner_temperature(const float temperature)
+{
+	char str[3] = {'-', '-'};
+	if (temperature > -10.0f && temperature <= 100.0f)
+		snprintf(str, sizeof(str), "%2.0f", temperature);
+	ui_write_string(30, 190, str, mkcolor(0, 0, 0), color_bg_inner, &font54_maple_bold);
+}
+void main_page_redraw_inner_humidity(const float humidity)
+{
+	char str[3] = {'-', '-'};
+	if (humidity > 0.0f && humidity <= 99.99f)
+		snprintf(str, sizeof(str), "%2.0f", humidity);
+	ui_write_string(28, 239, str, mkcolor(0, 0, 0), color_bg_inner, &font64_maple_extrabold);
+}
+// 动态绘制城市
+void main_page_redraw_outdoor_city(const char *city)
+{
+	char str[9];
+	snprintf(str, sizeof(str), "%s", city);
+	ui_write_string(127, 170, str, mkcolor(0, 0, 0), color_bg_outdoor, &font24_maple_bold);
+}
+// 动态绘制室外温度
+void main_page_redraw_outdoor_temperature(const float temperature)
+{
+	char str[3] = {'-', '-'};
+	if (temperature > -10.0f && temperature <= 100.0f)
+		snprintf(str, sizeof(str), "%2.0f", temperature);
+	ui_write_string(135, 190, str, mkcolor(0, 0, 0), color_bg_outdoor, &font54_maple_bold);
+}
+// 动态绘制天气图标
+void main_page_redraw_outdoor_weather_icon(const int code)
+{
+	const image_t *icon;
+	if (code == 0 || code == 2 || code == 38)
+		icon = &image_qing;
+	else if (code == 1 || code == 3)
+		icon = &image_yueliang;
+	else if (code == 4 || code == 9)
+		icon = &image_yintian;
+	else if (code == 5 || code == 6 || code == 7 || code == 8)
+		icon = &image_duoyun;
+	else if (code == 10 || code == 13 || code == 14 || code == 15 || code == 16 || code == 17 || code == 18 || code == 19)
+		icon = &image_zhongyu;
+	else if (code == 11 || code == 12)
+		icon = &image_leizhenyu;
+	else if (code == 20 || code == 21 || code == 22 || code == 23 || code == 24 || code == 25)
+		icon = &image_zhongxue;
+	else
+		icon = &image_icon_na;
+	ui_draw_image(166, 248, icon);
+}

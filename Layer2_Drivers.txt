@@ -1,0 +1,1340 @@
+// ==========================================
+// --- aht20.c ---
+// ==========================================
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdint.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "stm32f4xx.h"                  // Device header
+#include "stm32f4xx_conf.h"
+#include "tim_delay.h"
+
+//PB8 I2C_SCL
+//PB9 I2C_SDA
+
+#define aht20_PAGE_SIZE 128
+
+static bool aht20_write(uint8_t data[], uint32_t length);
+static bool aht20_read(uint8_t data[], uint32_t length);
+static bool aht20_read_status(uint8_t *status);
+static bool aht20_is_ready (void);
+
+bool aht20_init(void)
+{
+	//初始化I2C
+	I2C_InitTypeDef I2C_InitStructure;
+	I2C_StructInit(&I2C_InitStructure);
+	I2C_InitStructure.I2C_Ack=I2C_Ack_Enable;
+	I2C_InitStructure.I2C_AcknowledgedAddress=I2C_AcknowledgedAddress_7bit;
+	I2C_InitStructure.I2C_ClockSpeed=100ul * 1000ul;
+	I2C_InitStructure.I2C_DutyCycle=I2C_DutyCycle_2;
+	I2C_InitStructure.I2C_Mode=I2C_Mode_I2C;
+	I2C_InitStructure.I2C_OwnAddress1=0x00;
+	I2C_Init(I2C1,&I2C_InitStructure);
+
+	//初始化GPIO
+	GPIO_InitTypeDef GPIO_InitStructure;
+	GPIO_StructInit(&GPIO_InitStructure);
+	GPIO_InitStructure.GPIO_Mode=GPIO_Mode_AF;
+	GPIO_InitStructure.GPIO_OType=GPIO_OType_OD;	//I2C硬件设计有一个弱上拉，必须用开漏输出！！！
+	GPIO_InitStructure.GPIO_Pin=GPIO_Pin_8 | GPIO_Pin_9;
+	GPIO_InitStructure.GPIO_PuPd=GPIO_PuPd_UP;
+	GPIO_InitStructure.GPIO_Speed=GPIO_High_Speed;
+	GPIO_Init(GPIOB,&GPIO_InitStructure);
+
+	//复用PB8 PB9引脚到I2C
+	GPIO_PinAFConfig(GPIOB,GPIO_PinSource8,GPIO_AF_I2C1);
+	GPIO_PinAFConfig(GPIOB,GPIO_PinSource9,GPIO_AF_I2C1);
+
+	vTaskDelay(pdMS_TO_TICKS(40));
+	if(aht20_is_ready())
+		return true;
+	if(!aht20_write((uint8_t []){0xBE, 0x08, 0x00}, 3))
+		return false;
+	for(uint32_t t = 0; t < 20; t ++)
+	{
+		vTaskDelay(pdMS_TO_TICKS(5));
+		if(aht20_is_ready())
+			return true;
+	}
+
+	return false;
+}
+//页写入和读取
+//超时检查 宏定义
+#define I2C_CHECK_EVENT(EVENT,TIMEOUT) \
+	do{ \
+		uint32_t timeout=TIMEOUT; \
+		while(!I2C_CheckEvent(I2C1, EVENT) && timeout>0) \
+		{ \
+			tim_delay_us(10); \
+			timeout -= 10; \
+		} \
+		if(timeout <= 0) return false; \
+	}while(0)		//	防止报错重复定义timeout
+
+
+static bool aht20_write(uint8_t data[], uint32_t length)
+{
+	I2C_AcknowledgeConfig(I2C1,ENABLE);
+	I2C_GenerateSTART(I2C1, ENABLE);
+	I2C_CHECK_EVENT(I2C_EVENT_MASTER_MODE_SELECT,1000);
+	I2C_Send7bitAddress(I2C1, 0x70, I2C_Direction_Transmitter);//发送地址位
+	I2C_CHECK_EVENT(I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED,1000);//发送完地址后的标志位
+	for(uint32_t i=0;i<length;i++)
+	{
+		I2C_SendData(I2C1,data[i]);
+		I2C_CHECK_EVENT(I2C_EVENT_MASTER_BYTE_TRANSMITTING,1000);	//需不需要换成I2C_EVENT_MASTER_BYTE_TRANSMITTED
+	}
+	I2C_GenerateSTOP(I2C1,ENABLE);
+
+	return true;
+}
+
+static bool aht20_read(uint8_t data[], uint32_t length)
+{
+	I2C_AcknowledgeConfig(I2C1,ENABLE);
+	I2C_GenerateSTART(I2C1, ENABLE);
+	I2C_CHECK_EVENT(I2C_EVENT_MASTER_MODE_SELECT,1000);
+	I2C_Send7bitAddress(I2C1, 0x70, I2C_Direction_Receiver);//接收地址位
+	I2C_CHECK_EVENT(I2C_EVENT_MASTER_RECEIVER_MODE_SELECTED,1000);//接收完地址后的标志位
+	for(uint8_t i=0;i<length;i++){
+		if(i == length - 1)
+			I2C_AcknowledgeConfig(I2C1, DISABLE);
+		I2C_CHECK_EVENT(I2C_EVENT_MASTER_BYTE_RECEIVED,1000);
+		data[i] = I2C_ReceiveData(I2C1);
+	}
+	I2C_GenerateSTOP(I2C1,ENABLE);
+
+	return true;
+}
+
+static bool aht20_read_status(uint8_t *status)
+{
+	uint8_t cmd = 0x71;
+	if(!aht20_write(&cmd, 1))
+		return false;
+	if(!aht20_read(status, 1))
+		return false;
+
+	return true;
+}
+//校准
+static bool aht20_is_busy (void)
+{
+	uint8_t status;
+	if(!aht20_read_status(&status))
+		return false;
+	return (status & 0x80) != 0;
+}
+static bool aht20_is_ready (void)
+{
+	uint8_t status;
+	if(!aht20_read_status(&status))
+		return false;
+	return (status & 0x08) != 0;
+}
+
+//触发测量
+bool aht20_start_measurement(void)
+{
+	return aht20_write((uint8_t[]){0xAC, 0x33, 0x00}, 3);
+
+}
+bool aht20_wait_for_measurement(void)
+{
+	for(uint32_t t = 0; t < 20; t ++)
+	{
+		vTaskDelay(pdMS_TO_TICKS(10));
+		if(!aht20_is_busy())
+			return true;
+	}
+	return false;
+}
+
+//回读数据 获取温度值
+bool aht20_read_measurement(float *temperature, float *humidity)
+{
+	uint8_t data[6];
+	if(!aht20_read(data, 6))
+		return false;
+
+	uint32_t raw_humidity = ((uint32_t)data[1] << 12) |
+							((uint32_t)data[2] << 4 |
+							((uint32_t)(data[3] & 0xF0) >> 4));
+	uint32_t raw_temperature = ((uint32_t)((data[3] & 0x0F) << 16) |
+								((uint32_t)data[4] << 8) |
+								((uint32_t)data[5]));
+	*humidity = (float)raw_humidity * 100.0f / (float)0x100000;
+	*temperature = (float)raw_temperature * 200.0f / (float)0x100000 - 50.0f;
+
+	return true;
+}
+
+
+// ==========================================
+// --- st7789.c ---
+// ==========================================
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "st7789.h"
+#include "font.h"
+#include "image.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+//SPI2_SCK   PB13
+//SPI2_MOSI  PB15
+//CS		PB12	片选信号低电平有效，当这个设备被选中，其他设备不被选中
+//RESET		PD1		注意！查看原理图中的pin5 NRST，这是stm32 mcu的一个复位引脚，这里不是给st7789复位使用的，需要另外用一个普通GPIO口控制
+//DC(RS)	PD13	Data/Command 选择是传输数据还是传输命令
+//BL		PD12	背光
+
+#define CS_PORT 	GPIOB
+#define CS_PIN		GPIO_Pin_12
+#define DC_PORT		GPIOD
+#define DC_PIN		GPIO_Pin_13
+#define BL_PORT		GPIOD
+#define BL_PIN		GPIO_Pin_12
+#define RESET_PORT	GPIOD
+#define RESET_PIN	GPIO_Pin_1
+
+static SemaphoreHandle_t write_gram_semaphore;
+static void st7789_init_display(void);
+
+//st7789初始化
+//GPIO
+static void st7789_io_init(void)
+{
+	GPIO_InitTypeDef GPIO_InitStruct;
+	GPIO_StructInit(&GPIO_InitStruct);
+
+	GPIO_ResetBits(BL_PORT, BL_PIN);		//初始化时先关闭背光
+
+	GPIO_InitStruct.GPIO_Mode=GPIO_Mode_OUT;
+	GPIO_InitStruct.GPIO_OType=GPIO_OType_PP;
+	GPIO_InitStruct.GPIO_Pin=GPIO_Pin_1 | GPIO_Pin_12  | GPIO_Pin_13;
+	GPIO_InitStruct.GPIO_PuPd=GPIO_PuPd_DOWN;
+	GPIO_InitStruct.GPIO_Speed=GPIO_High_Speed;
+	GPIO_Init(GPIOD,&GPIO_InitStruct);
+
+	GPIO_InitStruct.GPIO_Pin=GPIO_Pin_12;
+	GPIO_Init(GPIOB,&GPIO_InitStruct);
+
+	//GPIO复用
+	GPIO_PinAFConfig(GPIOB,GPIO_PinSource13,GPIO_AF_SPI2);
+	GPIO_PinAFConfig(GPIOB,GPIO_PinSource15,GPIO_AF_SPI2);
+
+	GPIO_InitStruct.GPIO_Mode=GPIO_Mode_AF;
+	GPIO_InitStruct.GPIO_OType=GPIO_OType_PP;
+	GPIO_InitStruct.GPIO_Pin=GPIO_Pin_13  | GPIO_Pin_15;
+	GPIO_InitStruct.GPIO_PuPd=GPIO_PuPd_DOWN;
+	GPIO_InitStruct.GPIO_Speed=GPIO_High_Speed;
+	GPIO_Init(GPIOB,&GPIO_InitStruct);
+}
+//spi
+static void st7789_spi_init(void)
+{
+	SPI_InitTypeDef SPI_InitStruct;
+	SPI_StructInit(&SPI_InitStruct);
+	SPI_InitStruct.SPI_CPOL=SPI_CPOL_High;			//时钟极性
+	SPI_InitStruct.SPI_CPHA=SPI_CPHA_2Edge;			//时钟相位
+	SPI_InitStruct.SPI_FirstBit=SPI_FirstBit_MSB;
+	SPI_InitStruct.SPI_BaudRatePrescaler=SPI_BaudRatePrescaler_4;
+	SPI_InitStruct.SPI_Mode=SPI_Mode_Master;
+	SPI_InitStruct.SPI_DataSize=SPI_DataSize_8b;
+	SPI_InitStruct.SPI_CRCPolynomial=7;
+	SPI_InitStruct.SPI_Direction=SPI_Direction_2Lines_FullDuplex;
+	SPI_InitStruct.SPI_NSS=SPI_NSS_Soft;
+	SPI_Init(SPI2,&SPI_InitStruct);
+
+	//使能SPI2
+	SPI_DMACmd(SPI2, SPI_I2S_DMAReq_Tx, ENABLE);
+	SPI_Cmd(SPI2,ENABLE);
+}
+//DMA
+static void st7789_dma_init(void)
+{
+	DMA_InitTypeDef DMA_Structure;
+	DMA_StructInit(&DMA_Structure);
+	DMA_Structure.DMA_Channel = DMA_Channel_0;									//SPI2使用通道0
+	DMA_Structure.DMA_PeripheralBaseAddr = (uint32_t)&SPI2->DR;					//DR寄存器地址
+	DMA_Structure.DMA_DIR = DMA_DIR_MemoryToPeripheral;							//传输方向 内存->外设
+	DMA_Structure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;    		//外设地址是否自增	false
+	DMA_Structure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord; //外设数据的单元大小
+	DMA_Structure.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;         //内存读取字节大小
+	DMA_Structure.DMA_Mode = DMA_Mode_Normal;                    			//循环/普通模式		普通
+	DMA_Structure.DMA_Priority = DMA_Priority_High;                		//优先级
+	DMA_Structure.DMA_FIFOMode = DMA_FIFOMode_Enable;               	 	//fifo
+	DMA_Structure.DMA_FIFOThreshold = DMA_FIFOThreshold_Full;
+	DMA_Structure.DMA_MemoryBurst = DMA_MemoryBurst_INC8;
+	DMA_Structure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
+	DMA_ITConfig(DMA1_Stream4, DMA_IT_TC, ENABLE);
+	DMA_Init(DMA1_Stream4, &DMA_Structure);									//SPI2_TX->DMA1_Stream4
+}
+//中断
+static void st7789_int_init(void)
+{
+	NVIC_InitTypeDef NVIC_InitStruct;
+	NVIC_InitStruct.NVIC_IRQChannel=DMA1_Stream4_IRQn;
+	NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority=5;
+	NVIC_InitStruct.NVIC_IRQChannelSubPriority=0;
+	NVIC_InitStruct.NVIC_IRQChannelCmd=ENABLE;
+	NVIC_Init(&NVIC_InitStruct);
+	NVIC_SetPriority(DMA1_Stream4_IRQn, 5);
+}
+
+void st7789_init(void)
+{
+	write_gram_semaphore = xSemaphoreCreateBinary();
+	configASSERT(write_gram_semaphore);
+
+	st7789_spi_init();
+	st7789_dma_init();
+	st7789_int_init();
+	st7789_io_init();
+
+	st7789_init_display();
+}
+
+//写st7789寄存器
+static void st7789_write_register(uint8_t reg, uint8_t data[], uint16_t length)
+{
+	SPI_DataSizeConfig(SPI2, SPI_DataSize_8b);
+
+	GPIO_ResetBits(CS_PORT, CS_PIN);		//先拉低片选信号再拉低DC
+
+	GPIO_ResetBits(DC_PORT, DC_PIN);		//DC为低表示接下来传输的是命令
+	SPI_SendData(SPI2,reg);
+	while(SPI_GetFlagStatus(SPI2,SPI_FLAG_TXE) == RESET);		//等待发送完成
+	while(SPI_GetFlagStatus(SPI2,SPI_FLAG_BSY) != RESET);		//等待总线空闲
+
+	GPIO_SetBits(DC_PORT, DC_PIN);			//DC为高表示接下来传输的是数据
+	for(uint16_t i=0;i<length;i++){
+		SPI_SendData(SPI2,data[i]);
+		while(!SPI_GetFlagStatus(SPI2,SPI_FLAG_TXE));
+	}
+	while(SPI_GetFlagStatus(SPI2,SPI_FLAG_BSY) != RESET);		//等待总线空闲
+
+	GPIO_SetBits(CS_PORT, CS_PIN);			//传输完数据后片选拉高，结束本次传输工作
+}
+
+//使用DMA
+static void st7789_write_gram(uint8_t data[], uint32_t length, bool singlecolor)
+{
+	SPI_DataSizeConfig(SPI2, SPI_DataSize_16b);
+
+	GPIO_ResetBits(CS_PORT, CS_PIN);		//先拉低片选信号再拉低DC
+	GPIO_SetBits(DC_PORT, DC_PIN);			//DC为高表示接下来传输的是数据
+
+	length /= 2;
+	do
+	{
+		uint32_t chunk_size = length < 65535 ? length : 65535;
+
+		if(singlecolor) DMA1_Stream4->CR &= ~DMA_SxCR_MINC;
+		else 			DMA1_Stream4->CR |= DMA_SxCR_MINC;
+		DMA1_Stream4->M0AR = (uint32_t)data;
+		DMA1_Stream4->NDTR = chunk_size;
+
+		DMA_Cmd(DMA1_Stream4, ENABLE);
+		xSemaphoreTake(write_gram_semaphore, portMAX_DELAY);
+
+		length -= chunk_size;
+		if (!singlecolor) data += chunk_size * 2;
+	}while(length > 0);
+
+	while(SPI_GetFlagStatus(SPI2,SPI_FLAG_BSY) != RESET);
+
+	GPIO_SetBits(CS_PORT, CS_PIN);			//传输完数据后片选拉高，结束本次传输工作
+}
+
+
+//显示屏复位
+static void st7789_reset(void)
+{
+	GPIO_ResetBits(RESET_PORT,RESET_PIN);
+	vTaskDelay(pdMS_TO_TICKS(2));		// 20us at least
+	GPIO_SetBits(RESET_PORT,RESET_PIN);
+	vTaskDelay(pdMS_TO_TICKS(120));				//延时等待是st7789芯片文档要求
+}
+
+//打开背光
+static void st7789_set_backlight(bool on)
+{
+	GPIO_WriteBit(BL_PORT, BL_PIN, on?Bit_SET:Bit_RESET);
+}
+
+
+//屏幕初始化
+static void st7789_init_display(void)
+{
+	st7789_reset();
+
+
+	st7789_write_register(0x11,NULL,0);					//退出睡眠模式，进入工作模式
+	vTaskDelay(pdMS_TO_TICKS(5));								//等待一段时间，得到电源稳定
+
+	st7789_write_register(0x3A, (uint8_t[]){0x05}, 1);	//设置颜色模式为RGB565，每个像素点数据都需要2个字节(前字节是前5位R4 R3 R2 R1 R0 G5 G4 G3后字节是前3位G2 G1 G0 B4 B3 B2 B1 B0)
+	st7789_write_register(0xC5, (uint8_t[]){0x1A}, 1);	//设置VCOM电压值
+	st7789_write_register(0x36, (uint8_t[]){0x00}, 1);	//设置屏幕扫描方向、颜色顺序、行列地址顺序、屏幕刷新方向等，0x00为默认设置，
+
+	//-------------ST7789V Frame rate setting-----------//
+	st7789_write_register(0xB2, (uint8_t[]){0x05,0x05,0x00,0x33,0x33}, 5);
+	st7789_write_register(0xB7, (uint8_t[]){0x05}, 1);
+	//--------------ST7789V Power setting---------------//
+	st7789_write_register(0xBB, (uint8_t[]){0x3F}, 1);
+	st7789_write_register(0xC0, (uint8_t[]){0x2C}, 1);
+	st7789_write_register(0xC2, (uint8_t[]){0x01}, 1);
+	st7789_write_register(0xC3, (uint8_t[]){0x0F}, 1);
+	st7789_write_register(0xC4, (uint8_t[]){0x20}, 1);
+	st7789_write_register(0xC6, (uint8_t[]){0x01}, 1);
+	st7789_write_register(0xD0, (uint8_t[]){0xA4,0xA1}, 2);
+	st7789_write_register(0xE8, (uint8_t[]){0x03}, 1);
+	st7789_write_register(0xE9, (uint8_t[]){0x09,0x09,0x08}, 3);
+	//---------------ST7789V gamma setting-------------//
+	st7789_write_register(0xE0, (uint8_t[]){0xD0,0x05,0x09,0x09,0x08,0x14,0x28,0x33,0x3F,0x07,0x13,0x14,0x28,0x30}, 14);
+	st7789_write_register(0xE1, (uint8_t[]){0xD0,0x05,0x09,0x09,0x08,0x03,0x24,0x32,0x32,0x3B,0x14,0x13,0x28,0x2F}, 14);
+	st7789_write_register(0x21,NULL,0);
+	st7789_write_register(0x29,NULL,0);					//开启屏幕显示
+
+	st7789_fill_color(0, 0, ST7789_WIDTH-1, ST7789_HEIGHT-1, 0xffff);
+	st7789_set_backlight(true);
+}
+
+//安全检测函数
+static bool in_screen_range(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
+{
+	if(x1 >= ST7789_WIDTH || y1 >= ST7789_HEIGHT)
+		return false;
+	if(x2 >= ST7789_WIDTH || y2 >= ST7789_HEIGHT)
+		return false;
+	if(x1 > x2 || y1 > y2)
+		return false;
+
+	return true;
+}
+
+//选择行列地址范围 ST7789 内部有一个地址计数器，它会自动在屏幕上的下一个像素点位置写入颜色值，通过设置行列地址范围可以实现。
+static void st7789_set_range_and_prepare_gram(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
+{
+	/* ST7789 的行列地址行列地址寄存器是16位的，一共支持 65535 个地址，而SPI 接口一次只能发送 8 位数据。
+	因此，需要把一个 16 位的地址拆分成高位8位字节和低位8位字节，分别写入。*/
+	st7789_write_register(0x2A,(uint8_t[]){(x1 >> 8) & 0xff, x1 & 0xff, (x2 >> 8) & 0xff, x2 & 0xff}, 4);	//设置行列地址范围，X轴范围
+	st7789_write_register(0x2B,(uint8_t[]){(y1 >> 8) & 0xff, y1 & 0xff, (y2 >> 8) & 0xff, y2 & 0xff}, 4);	//设置行列地址范围，Y轴范围
+	/*设置内存写入模式，告诉st7789接下来要发送的颜色数据，需要被写入到其内部 GRAM 的当前位置*/
+	st7789_write_register(0x2C, NULL, 0);
+}
+
+
+//刷新矩形:用指定的第一种颜色 color，在屏幕上从 (x1, y1)到 (x2, y2)的矩形区域.
+void st7789_fill_color(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color)
+{
+	//安全自检
+	if(!in_screen_range(x1, y1, x2, y2)){
+		return;
+	}
+
+	//选择进入内存写入模式
+	st7789_set_range_and_prepare_gram(x1, y1, x2, y2);
+
+	uint32_t pixels = (x2-x1+1) * (y2-y1+1);			//计算填充的像素
+	st7789_write_gram((uint8_t *)&color, pixels * 2, true);
+}
+
+static void st7789_draw_font(uint16_t x, uint16_t y, uint16_t width, uint16_t height, const uint8_t *model, uint16_t color, uint16_t bg_color)
+{
+	uint16_t bytes_per_row = (width + 7) / 8;
+
+	static uint8_t buff[76 * 76 * 2];
+	uint8_t *pbuff = buff;
+	for(uint16_t row = 0; row < height; row ++){
+		const uint8_t *row_data = model + row * bytes_per_row;
+		for(uint16_t col = 0; col < width; col++){
+			uint8_t pixel = row_data[col / 8] & (1 << (7 - col %8));
+			uint16_t pixel_color = pixel ? color : bg_color;
+			*pbuff++ = pixel_color & 0xFF;        // 低字节
+			*pbuff++ = (pixel_color >> 8) & 0xFF; // 高字节
+		}
+	}
+
+	st7789_set_range_and_prepare_gram(x, y, x + width - 1, y + height - 1);
+	st7789_write_gram(buff, pbuff - buff, false);
+}
+
+//ASCII字符模型获取
+static const uint8_t *ascii_get_model(const char ch, const font_t *font)
+{
+	uint16_t bytes_per_row = (font->size / 2 + 7) / 8;
+	uint16_t bytes_per_char = font->size * bytes_per_row;
+	if(font->ascii_map)
+	{
+		const char *map = font->ascii_map;
+		do
+		{
+			if(*map == ch)
+			{
+				return font->ascii_model + (map - font->ascii_map) * bytes_per_char;
+			}
+		}while(*(++map) != '\0');
+	}
+	else
+	{
+		return font->ascii_model + (ch - ' ') * bytes_per_char;
+	}
+
+	return NULL;
+}
+
+//写一个ascii字符
+static void st7789_write_ascii(uint16_t x, uint16_t y, const char ch, uint16_t color, uint16_t bg_color ,const font_t *font)
+{
+	uint16_t fheight = font->size, fwidth = font->size/2;
+
+
+	if(font == NULL)
+		return;
+
+	if(ch < 0x20 || ch > 0x7E)
+		return;
+
+	if(!in_screen_range(x, y, x + fwidth - 1, y + fheight - 1)){
+		return;
+	}
+
+	const uint8_t *model = ascii_get_model(ch, font);
+	if(model)
+		st7789_draw_font(x, y, fwidth, fheight, model, color, bg_color);
+
+}
+
+//写汉字
+static void st7789_write_chinese(uint16_t x, uint16_t y, const char *ch, uint16_t color, uint16_t bg_color ,const font_t *font)
+{
+	if(font == NULL || ch == NULL)
+		return;
+
+	uint16_t fheight = font->size, fwidth = font->size;
+	if(!in_screen_range(x, y, x + fwidth - 1, y + fheight - 1)){
+		return;
+	}
+
+	const font_chinese_t *c = font->chinese;
+	for(; c->name != NULL;c++){
+		if(strcmp(c->name, ch) == 0)	//一样返回0
+			break;
+	}
+	if(c->name == NULL)
+			return;
+
+	st7789_draw_font(x, y, fwidth, fheight, c->model, color, bg_color);
+}
+
+//识别是否是GB2312
+static bool is_gb2312(char ch)
+{
+	return ((unsigned char)ch >= 0xA1 && (unsigned char)ch <= 0xF7);
+}
+
+void st7789_write_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg_color ,const font_t *font)
+{
+
+	while(*str){
+		//int len = utf8_char_length(*str);
+		int len = is_gb2312(*str) ? 2 : 1;
+		if(len <= 0){
+			str++;
+			continue;
+		}
+		else if(len == 1){
+			st7789_write_ascii(x, y, *str, color, bg_color, font);
+			str ++;
+			x += font->size / 2;
+		}
+		else{
+			char ch[5];
+			strncpy(ch, str, len);
+			st7789_write_chinese(x, y, ch, color, bg_color, font);
+			str += len;
+			x += font->size;
+		}
+	}
+}
+void st7789_draw_image(uint16_t x, uint16_t y, const image_t *image)
+{
+	if(x >= ST7789_WIDTH || y >= ST7789_HEIGHT || x + image->width-1 >= ST7789_WIDTH || y + image->height-1 >= ST7789_HEIGHT){
+		return;
+	}
+
+	st7789_set_range_and_prepare_gram(x, y, x + image->width - 1, y + image->height - 1);
+
+	st7789_write_gram((uint8_t *)image->data, image->height * image->width * 2, false);
+}
+
+void DMA1_Stream4_IRQHandler(void)
+{
+	if(DMA_GetITStatus(DMA1_Stream4, DMA_IT_TCIF4) == SET)
+	{
+		BaseType_t pxHigherPriorityTaskWoken;
+		xSemaphoreGiveFromISR(write_gram_semaphore, &pxHigherPriorityTaskWoken);
+		portYIELD_FROM_ISR(pxHigherPriorityTaskWoken);
+
+		DMA_ClearITPendingBit(DMA1_Stream4, DMA_IT_TCIF4);
+	}
+}
+
+// ==========================================
+// --- esp_at.c ---
+// ==========================================
+#include <stdbool.h>
+#include <stdio.h>
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "string.h"
+#include "esp_at.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include "console.h"
+#include "weather.h"
+
+// TX: PD8
+// RX: PD9
+
+typedef enum
+{
+	AT_ACK_NONE,
+	AT_ACK_OK,
+	AT_ACK_ERROR,
+	AT_ACK_BUSY,
+	AT_ACK_READY,
+} at_ack_t;
+
+typedef struct
+{
+	at_ack_t ack;
+	const char *string;
+} at_ack_match_t;
+
+static const at_ack_match_t at_ack_matches[] =
+	{
+		{AT_ACK_OK, "OK\r\n"},
+		{AT_ACK_ERROR, "ERROR\r\n"},
+		{AT_ACK_BUSY, "busy p…\r\n"},
+		{AT_ACK_READY, "ready\r\n"},
+};
+
+static char *rxline;
+static char rxbuf[1024];
+static char txbuf[1024];
+static uint32_t rxlen;
+static at_ack_t rxack;
+static SemaphoreHandle_t at_ack_semaphore;
+
+static bool esp_at_wait_ready(uint32_t timeout);
+static bool esp_at_write_command(const char *command, uint32_t timeout);
+static void esp_at_usart_write(const char *data);
+static bool esp_at_wait_boot(uint32_t timeout);
+
+static void esp_at_io_init(void)
+{
+	GPIO_InitTypeDef GPIO_InitStructure;
+	GPIO_StructInit(&GPIO_InitStructure);
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
+	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_UP;
+	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8 | GPIO_Pin_9;
+	GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+	// PD8 PD9引脚复用
+	GPIO_PinAFConfig(GPIOD, GPIO_PinSource8, GPIO_AF_USART3);
+	GPIO_PinAFConfig(GPIOD, GPIO_PinSource9, GPIO_AF_USART3);
+}
+static void esp_at_usart_init(void)
+{
+	USART_InitTypeDef USART_InitStructure;
+	USART_StructInit(&USART_InitStructure);
+
+	USART_InitStructure.USART_BaudRate = 115200u;
+	USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+	USART_InitStructure.USART_StopBits = USART_StopBits_1;
+	USART_InitStructure.USART_Parity = USART_Parity_No;
+	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+	USART_Init(USART3, &USART_InitStructure);
+
+	USART_DMACmd(USART3, USART_DMAReq_Tx, ENABLE);
+	USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+	USART_Cmd(USART3, ENABLE);
+}
+static void esp_at_dma_init(void)
+{
+	DMA_InitTypeDef DMA_Structure;
+	DMA_StructInit(&DMA_Structure);
+	DMA_Structure.DMA_Channel = DMA_Channel_4;									// USART3使用通道4
+	DMA_Structure.DMA_PeripheralBaseAddr = (uint32_t)&USART3->DR;			// DR寄存器地址
+	DMA_Structure.DMA_DIR = DMA_DIR_MemoryToPeripheral;						// 传输方向 内存->外设
+	DMA_Structure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;		// 外设地址是否自增	false
+	DMA_Structure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte; // 外设数据单元大小
+	DMA_Structure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;			// 内存读取字节大小
+	DMA_Structure.DMA_MemoryInc = DMA_MemoryInc_Enable;
+	DMA_Structure.DMA_Mode = DMA_Mode_Normal;		  // 循环/单次模式		单次
+	DMA_Structure.DMA_Priority = DMA_Priority_Medium; // 优先级
+	DMA_Structure.DMA_FIFOMode = DMA_FIFOMode_Enable; // 启用
+	DMA_Structure.DMA_FIFOThreshold = DMA_FIFOThreshold_Full;
+	DMA_Structure.DMA_MemoryBurst = DMA_MemoryBurst_INC8;
+	DMA_Structure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
+	DMA_Init(DMA1_Stream3, &DMA_Structure); // USART3_TX->DMA1_Stream3
+}
+static void esp_at_int_init(void)
+{
+	// 初始化串口的RX中断
+	NVIC_InitTypeDef NVIC_InitStruct;
+	NVIC_InitStruct.NVIC_IRQChannel = USART3_IRQn;
+	NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 5;
+	NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
+	NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
+	NVIC_Init(&NVIC_InitStruct);
+	NVIC_SetPriority(USART3_IRQn, 5);
+}
+
+static void esp_at_lowlevel_init(void)
+{
+	esp_at_usart_init();
+	esp_at_dma_init();
+	esp_at_int_init();
+	esp_at_io_init();
+}
+
+bool esp_at_init(void)
+{
+	at_ack_semaphore = xSemaphoreCreateBinary();
+	configASSERT(at_ack_semaphore);
+
+	esp_at_lowlevel_init();
+
+	if (!esp_at_wait_boot(5000))
+	{
+		printf("AT Failed\r\n");
+		return false;
+	}
+
+	if (!esp_at_write_command("AT+RESTORE\r\n", 5000))
+	{
+		printf("AT+RESTORE  Failed\r\n");
+		return false;
+	}
+
+	if (!esp_at_wait_ready(7000))
+	{
+		printf("get ready Failed\r\n");
+		return false;
+	}
+
+	printf("ready yes\r\n");
+	return true;
+}
+
+// 发送命令内容函数（独立成一个小函数）
+static void esp_at_usart_write(const char *data)
+{
+	uint32_t len = strlen(data);
+	DMA1_Stream3->M0AR = (uint32_t)data;
+	DMA1_Stream3->NDTR = len;
+
+	DMA_ClearFlag(DMA1_Stream3, DMA_FLAG_TCIF3);
+	DMA_Cmd(DMA1_Stream3, ENABLE);
+}
+
+// 匹配接收的字符串
+static at_ack_t match_internal_ack(const char *str)
+{
+	for (uint32_t i = 0; i < ARRAY_SIZE(at_ack_matches); i++)
+	{
+		if (strcmp(str, at_ack_matches[i].string) == 0)
+		{
+			return at_ack_matches[i].ack;
+		}
+	}
+	return AT_ACK_NONE;
+}
+
+// 接收完毕
+static at_ack_t esp_at_usart_wait_receive(uint32_t timeout)
+{
+	rxlen = 0;
+	rxline = rxbuf;
+	bool acked = xSemaphoreTake(at_ack_semaphore, pdMS_TO_TICKS(timeout)) == pdPASS;
+	return acked ? rxack : AT_ACK_NONE;
+}
+
+// 等待一个特定的ack，如ready
+static bool esp_at_wait_ready(uint32_t timeout)
+{
+	return esp_at_usart_wait_receive(timeout) == AT_ACK_READY;
+}
+
+// 写命令，检查返回值是否OK
+static bool esp_at_write_command(const char *command, uint32_t timeout)
+{
+// 加一点调试信息
+#if ESP_AT_DEBUG
+	printf("[DEBUG] Send: %s\n", command);
+#endif
+	esp_at_usart_write(command);
+	at_ack_t ack = esp_at_usart_wait_receive(timeout);
+// 调试信息
+#if ESP_AT_DEBUG
+	printf("[DEBUG] Response: \n%s\n", rxbuf);
+#endif
+	return ack == AT_ACK_OK;
+}
+
+// 获取外部的一个响应值
+static const char *esp_at_get_response(void)
+{
+	return rxbuf;
+}
+
+// 增加一个等待esp32启动完成的函数
+static bool esp_at_wait_boot(uint32_t timeout)
+{
+	for (int t = 0; t < timeout; t += 100)
+	{
+		if (esp_at_write_command("AT\r\n", 100))
+			return true;
+	}
+	return false;
+}
+
+// 连接wifi初始化
+bool esp_at_wifi_init(void)
+{
+	return esp_at_write_command("AT+CWMODE=1\r\n", 2000);
+}
+// 连接wifi函数
+bool esp_at_connect_wifi(const char *ssid, const char *pwd, const char *mac)
+{
+	if (ssid == NULL || pwd == NULL)
+		return false;
+
+	char cmd[128];
+	int len = snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, pwd); // ssid为wifi或热点名称，pwd为wifi或热点密码，需替换
+	if (mac)
+		snprintf(cmd + len, sizeof(cmd) - len, ",\"%s\"", mac);
+
+	return esp_at_write_command(cmd, 15000);
+}
+
+// 解析wifi数据
+static bool parse_cwstate_response(const char *response, esp_wifi_info_t *info)
+{
+	// AT+CWSTATE?
+	//+CWSTATE:2,"iPhone18promax"
+
+	// OK
+	response = strstr(response, "+CWSTATE:");
+	if (response == NULL)
+		return false;
+
+	int wifi_state;
+	if (sscanf(response, "+CWSTATE:%d,\"%31[^\"]\"", &wifi_state, info->ssid) != 2)
+		return false;
+
+	info->connected = (wifi_state == 2);
+
+	return true;
+}
+
+static bool parse_cwjap_response(const char *response, esp_wifi_info_t *info)
+{
+	// AT+CWJAP?
+	//+CWJAP:"iPhone18promax","c2:09:f2:22:7d:2b",6,-41,0,1,3,0,1
+
+	// OK
+	response = strstr(response, "+CWJAP:");
+	if (response == NULL)
+		return false;
+
+	if (sscanf(response, "+CWJAP:\"%31[^\"]\",\"%17[^\"]\",%d,%d", info->ssid, info->bssid, &info->channel, &info->rssi) != 4)
+		return false;
+
+	return true;
+}
+// 检查wifi是否连接成功
+bool esp_at_get_wifi_info(esp_wifi_info_t *info)
+{
+	if (!esp_at_write_command("AT+CWSTATE?\r\n", 2000)) // 查询esp设备wifi状态和wifi信息
+		return false;
+	// 解析获取的内容
+	if (!parse_cwstate_response(esp_at_get_response(), info))
+		return false;
+	if (info->connected == true)
+	{
+		if (!esp_at_write_command("AT+CWJAP?\r\n", 2000)) // 查询与esp32station连接的AP信息
+			return false;
+		// 解析
+		if (!parse_cwjap_response(esp_at_get_response(), info))
+			return false;
+	}
+	return true;
+}
+// wifi是否连接
+bool wifi_is_connected(void)
+{
+	esp_wifi_info_t info;
+	if (esp_at_get_wifi_info(&info))
+		return info.connected;
+	return false;
+}
+
+// 时间获取
+bool esp_at_sntp_init(void)
+{
+	if (!esp_at_write_command("AT+CIPSNTPCFG=1,8\r\n", 2000))
+		return false;
+	return true;
+}
+// 月份字符串转数字（Jan=1, Feb=2, ..., Dec=12）
+static uint8_t month_str_to_num(const char *month_str)
+{
+	const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+	for (uint8_t i = 0; i < 12; i++)
+	{
+		if (strcmp(month_str, months[i]) == 0)
+			return i + 1;
+	}
+	return 0; // 无效月份
+}
+
+// 星期字符串转数字（Sun=0, Mon=1, ..., Sat=6）
+static uint8_t weekday_str_to_num(const char *weekday_str)
+{
+	const char *weekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+	for (uint8_t i = 0; i < 7; i++)
+	{
+		if (strcmp(weekday_str, weekdays[i]) == 0)
+			return i + 1;
+	}
+
+	return 0; // 无效星期
+}
+static bool parse_cipsntptime_response(const char *response, esp_date_time_t *date)
+{
+	response = strstr(response, "+CIPSNTPTIME:");
+	if (response == NULL)
+		return false;
+	char weekday_str[4];
+	char month_str[4];
+
+	if (sscanf(response, "+CIPSNTPTIME:%3s %3s %hhu %hhu:%hhu:%hhu %hu", weekday_str, month_str, &date->day, &date->hour, &date->minute, &date->second, &date->year) != 7)
+		return false;
+
+	date->weekday = weekday_str_to_num(weekday_str);
+	date->month = month_str_to_num(month_str);
+
+	return true;
+}
+// 解析时间
+bool esp_at_sntp_get_time(esp_date_time_t *date)
+{
+	if (!esp_at_write_command("AT+CIPSNTPTIME?\r\n", 2000))
+		return false;
+
+	// 解析
+	if (!parse_cipsntptime_response(esp_at_get_response(), date))
+		return false;
+
+	return true;
+}
+
+// 请求网络链接
+const char *esp_at_http_get(const char *url)
+{
+	snprintf(txbuf, sizeof(txbuf), "AT+HTTPCLIENT=2,1,\"%s\",,,2\r\n", url);
+	bool ret = esp_at_write_command(txbuf, 5000); // 将请求网络连接的命令发送出去，并延时5s
+	return ret ? esp_at_get_response() : NULL;
+}
+
+// USART的中断函数
+void USART3_IRQHandler(void)
+{
+	if (USART_GetITStatus(USART3, USART_IT_RXNE) == SET)
+	{
+		if (rxlen < (sizeof(rxbuf) - 1))
+		{
+			rxbuf[rxlen++] = USART_ReceiveData(USART3);
+
+			if (rxbuf[rxlen - 1] == '\n')
+			{
+				rxbuf[rxlen] = '\0';
+				at_ack_t ack = match_internal_ack(rxline);
+
+				if (ack != AT_ACK_NONE)
+				{
+					rxack = ack;
+					BaseType_t pxHigherPriorityTaskWoken;
+					xSemaphoreGiveFromISR(at_ack_semaphore, &pxHigherPriorityTaskWoken);
+					portYIELD_FROM_ISR(pxHigherPriorityTaskWoken);
+				}
+				rxline = rxbuf + rxlen; // 若与OK或ERROR匹配不上，则找下一句
+			}
+		}
+	}
+	USART_ClearITPendingBit(USART3, USART_IT_RXNE);
+}
+
+// ==========================================
+// --- rtc.c ---
+// ==========================================
+#include <stdbool.h>
+#include <string.h>
+#include <stdint.h>
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "rtc.h"
+
+void rtc_init(void)
+{
+	RTC_InitTypeDef RTC_InitStructure;
+	RTC_StructInit(&RTC_InitStructure);
+	RTC_Init(&RTC_InitStructure);
+
+	RCC_RTCCLKCmd(ENABLE);
+	RTC_WaitForSynchro();
+}
+// 确保在写入时间时不会被打断，时间一致
+static void rtc_set_time_once(const rtc_date_time_t *date_time)
+{
+	RTC_DateTypeDef date;
+	RTC_TimeTypeDef time;
+	RTC_DateStructInit(&date);
+	RTC_TimeStructInit(&time);
+
+	date.RTC_Year = date_time->year - 2000;
+	date.RTC_Month = date_time->month;
+	date.RTC_Date = date_time->day;
+	date.RTC_WeekDay = date_time->weekday;
+	time.RTC_Hours = date_time->hour;
+	time.RTC_Minutes = date_time->minute;
+	time.RTC_Seconds = date_time->second;
+
+	RTC_SetDate(RTC_Format_BIN, &date);
+	RTC_SetTime(RTC_Format_BIN, &time);
+}
+// 确保读取时间时不会被打断，防止读取到错误值
+static void rtc_get_time_once(rtc_date_time_t *date_time)
+{
+	RTC_DateTypeDef date;
+	RTC_TimeTypeDef time;
+	RTC_DateStructInit(&date);
+	RTC_TimeStructInit(&time);
+
+	RTC_GetTime(RTC_Format_BIN, &time);
+	RTC_GetDate(RTC_Format_BIN, &date);
+
+	date_time->year = 2000 + date.RTC_Year;
+	date_time->month = date.RTC_Month;
+	date_time->day = date.RTC_Date;
+	date_time->weekday = date.RTC_WeekDay;
+	date_time->hour = time.RTC_Hours;
+	date_time->minute = time.RTC_Minutes;
+	date_time->second = time.RTC_Seconds;
+}
+void rtc_set_time(const rtc_date_time_t *date_time)
+{
+	rtc_date_time_t rtime;
+	uint8_t retry_count = 0;
+	const uint8_t MAX_RETRY = 3;
+	do
+	{
+		// 进入临界区，防止被其他中断打断
+		taskENTER_CRITICAL();
+		rtc_set_time_once(date_time);
+		rtc_get_time_once(&rtime);
+		// 退出临界区，让系统正常运行
+		taskEXIT_CRITICAL();
+
+		if (date_time->second == rtime.second)
+		{
+			break;
+		}
+		retry_count++;
+	} while (retry_count < MAX_RETRY);
+}
+
+void rtc_get_time(rtc_date_time_t *date_time)
+{
+	rtc_date_time_t time1, time2;
+	uint8_t retry_count = 0;
+	const uint8_t MAX_RETRY = 3;
+	do
+	{
+		// 进入临界区，在读取时间时防止被高优先级中断打断
+		// 进入临界区，防止被其他中断打断
+		taskENTER_CRITICAL();
+
+		rtc_get_time_once(&time1);
+		rtc_get_time_once(&time2);
+
+		// 退出临界区，让系统正常运行
+		taskEXIT_CRITICAL();
+
+		if (memcmp(&time1, &time2, sizeof(rtc_date_time_t)) == 0)
+		{
+			memcpy(date_time, &time1, sizeof(rtc_date_time_t));
+			return;
+		}
+
+		retry_count++;
+	} while (retry_count < MAX_RETRY);
+
+	// 如果重试多次后依然失败，则直接拿最后一次读取的值返回，防止系统卡死
+	memcpy(date_time, &time2, sizeof(rtc_date_time_t));
+}
+
+// ==========================================
+// --- tim_delay.c ---
+// ==========================================
+#include "stdint.h"
+#include "stm32f4xx.h"                  // Device header
+#include "stm32f4xx_conf.h"
+#include "tim_delay.h"
+
+
+static volatile uint64_t tim_tick_count;
+static tim_periodic_callback_t periodic_callback;
+
+void tim_delay_init(void)
+{
+	RCC_ClocksTypeDef RCC_ClocksStruct;
+	RCC_GetClocksFreq(&RCC_ClocksStruct);
+	uint32_t apb1_tim_freq_mhz = RCC_ClocksStruct.PCLK1_Frequency / 1000 / 1000 * 2;
+
+
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
+    TIM_TimeBaseStructure.TIM_Prescaler = apb1_tim_freq_mhz - 1;   // 分频 1us一次计数
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;   // 向上计数
+    TIM_TimeBaseStructure.TIM_Period = 999;          // 自动重装载值，1ms中断一次，
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseInit(TIM6, &TIM_TimeBaseStructure);
+
+    TIM_ITConfig(TIM6, TIM_IT_Update, ENABLE);
+
+    NVIC_InitTypeDef NVIC_InitStructure;
+    NVIC_InitStructure.NVIC_IRQChannel = TIM6_DAC_IRQn;  // TIM6中断通道
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 10;  // 抢占优先级
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;     // 子优先级
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    TIM_Cmd(TIM6, ENABLE);
+}
+
+uint64_t tim_now(void)
+{
+	uint64_t now, last_count;
+	do{
+		last_count = tim_tick_count;
+		now = tim_tick_count + TIM_GetCounter(TIM6);
+	}while(last_count != tim_tick_count);
+	return now;
+}
+
+uint64_t tim_get_us(void)
+{
+	return tim_now();
+}
+
+uint64_t tim_get_ms(void)
+{
+	return tim_now() / 1000;
+}
+
+void tim_delay_us(uint32_t us)
+{
+	uint64_t now = tim_now();
+	while(tim_now() - now < (uint64_t)us);
+}
+
+void tim_delay_ms(uint32_t ms)
+{
+	uint64_t now = tim_now();
+	while(tim_now() - now < (uint64_t)ms * 1000);
+}
+
+void tim_register_periodic_callback(tim_periodic_callback_t callback)
+{
+	periodic_callback = callback;
+}
+
+void TIM6_DAC_IRQHandler(void)
+{
+	if (TIM_GetITStatus(TIM6, TIM_IT_Update) != RESET)
+	{
+        TIM_ClearITPendingBit(TIM6, TIM_IT_Update);  // 清除中断标志
+        tim_tick_count += 1000;  // 每次中断增加1ms对应的tick值
+		if(periodic_callback)
+			periodic_callback();
+	}
+}
+
+// ==========================================
+// --- console.c ---
+// ==========================================
+#include "stm32f4xx.h"
+#include "stm32f4xx_conf.h"
+#include "string.h"
+#include "console.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+// TX: PA9
+// RX: PA10
+
+static SemaphoreHandle_t write_async_semaphore;
+static console_received_func_t received_func;
+
+// GPIO
+static void console_io_init(void)
+{
+	GPIO_InitTypeDef GPIO_InitStructure;
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
+	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_UP;
+	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_9 | GPIO_Pin_10;
+	GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+	// PA9、PA10引脚复用
+	GPIO_PinAFConfig(GPIOA, GPIO_PinSource9, GPIO_AF_USART1);
+	GPIO_PinAFConfig(GPIOA, GPIO_PinSource10, GPIO_AF_USART1);
+}
+// usart
+static void console_usart_init(void)
+{
+	USART_InitTypeDef USART_InitStructure;
+	USART_StructInit(&USART_InitStructure);
+
+	USART_InitStructure.USART_BaudRate = 115200u;
+	USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+	USART_InitStructure.USART_StopBits = USART_StopBits_1;
+	USART_InitStructure.USART_Parity = USART_Parity_No;
+	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+	USART_Init(USART1, &USART_InitStructure);
+
+	USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+	USART_DMACmd(USART1, USART_DMAReq_Tx, ENABLE);
+	USART_Cmd(USART1, ENABLE);
+}
+// DMA
+static void console_dma_init(void)
+{
+	DMA_InitTypeDef DMA_Structure;
+	DMA_StructInit(&DMA_Structure);
+	DMA_Structure.DMA_Channel = DMA_Channel_4;									// USART1使用通道4
+	DMA_Structure.DMA_PeripheralBaseAddr = (uint32_t)&USART1->DR;			// DR寄存器地址
+	DMA_Structure.DMA_DIR = DMA_DIR_MemoryToPeripheral;						// 传输方向 内存->外设
+	DMA_Structure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;		// 外设地址是否自增	false
+	DMA_Structure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte; // 外设数据单元大小
+	DMA_Structure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;			// 内存读取字节大小
+	DMA_Structure.DMA_MemoryInc = DMA_MemoryInc_Enable;
+	DMA_Structure.DMA_Mode = DMA_Mode_Normal;		  // 循环/单次模式		单次
+	DMA_Structure.DMA_Priority = DMA_Priority_Low;	  // 优先级
+	DMA_Structure.DMA_FIFOMode = DMA_FIFOMode_Enable; // 启用
+	DMA_Structure.DMA_FIFOThreshold = DMA_FIFOThreshold_Full;
+	DMA_Structure.DMA_MemoryBurst = DMA_MemoryBurst_INC8;
+	DMA_Structure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
+	DMA_ITConfig(DMA2_Stream7, DMA_IT_TC, ENABLE);
+	DMA_Init(DMA2_Stream7, &DMA_Structure); // USART1_TX->DMA1_Stream4
+}
+// 中断
+static void console_int_init(void)
+{
+	// 初始化串口的RX中断
+	NVIC_InitTypeDef NVIC_InitStruct;
+	NVIC_InitStruct.NVIC_IRQChannel = USART1_IRQn;
+	NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 5;
+	NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
+	NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
+	NVIC_Init(&NVIC_InitStruct);
+	NVIC_SetPriority(USART1_IRQn, 5);
+
+	// 初始化dma的TC中断
+	NVIC_InitStruct.NVIC_IRQChannel = DMA2_Stream7_IRQn;
+	NVIC_Init(&NVIC_InitStruct);
+	NVIC_SetPriority(DMA2_Stream7_IRQn, 5);
+}
+
+void console_init(void)
+{
+	write_async_semaphore = xSemaphoreCreateBinary(); // 创建一个二值信号量
+	configASSERT(write_async_semaphore);			  // 做一个安全检查，检查信号量是否创建成功
+
+	console_usart_init();
+	console_dma_init();
+	console_int_init();
+	console_io_init();
+}
+void console_write(const char str[])
+{
+	uint32_t length = strlen(str);
+	do
+	{
+		uint32_t chunk_size = length < 65535 ? length : 65535;
+
+		DMA2_Stream7->M0AR = (uint32_t)str;
+		DMA2_Stream7->NDTR = chunk_size;
+
+		DMA_Cmd(DMA2_Stream7, ENABLE);
+		xSemaphoreTake(write_async_semaphore, portMAX_DELAY);
+
+		length -= chunk_size;
+		str += chunk_size;
+	} while (length > 0);
+
+	while (USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET)
+		;
+	USART_ClearFlag(USART1, USART_FLAG_TC);
+}
+// USART的回调函数
+void console_received_register(console_received_func_t func)
+{
+	received_func = func;
+}
+// USART的中断函数
+void USART1_IRQHandler(void)
+{
+	if (USART_GetITStatus(USART1, USART_IT_RXNE) == SET)
+	{
+		if (received_func != NULL)
+		{
+			uint8_t data = USART_ReceiveData(USART1);
+			received_func(data);
+		}
+		USART_ClearITPendingBit(USART1, USART_IT_RXNE);
+	}
+}
+void DMA2_Stream7_IRQHandler(void)
+{
+	if (DMA_GetITStatus(DMA2_Stream7, DMA_IT_TCIF7) == SET)
+	{
+		BaseType_t pxHigherPriorityTaskWoken;
+		xSemaphoreGiveFromISR(write_async_semaphore, &pxHigherPriorityTaskWoken);
+		portYIELD_FROM_ISR(pxHigherPriorityTaskWoken);
+
+		DMA_ClearITPendingBit(DMA2_Stream7, DMA_IT_TCIF7);
+	}
+}

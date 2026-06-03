@@ -1,0 +1,326 @@
+// ==========================================
+// --- driver/aht20/aht20.h ---
+// ==========================================
+#ifndef __AHT20_H__
+#define __AHT20_H__
+
+#include <stdbool.h>
+#include "stm32f4xx.h"                  // Device header
+#include "stm32f4xx_conf.h"
+#include "tim_delay.h"
+
+//PB8 I2C_SCL
+//PB9 I2C_SDA
+
+bool aht20_init(void);
+bool aht20_start_measurement(void);
+bool aht20_wait_for_measurement(void);
+bool aht20_read_measurement(float *temperature, float *humidity);
+
+
+#endif /*__AHT20_H__*/
+
+// ==========================================
+// --- driver/st7789/st7789.h ---
+// ==========================================
+#ifndef _ST7789_H_
+#define _ST7789_H_
+
+#define ST7789_WIDTH 240
+#define ST7789_HEIGHT 320
+
+#include "font.h"
+#include "image.h"
+
+void st7789_init(void);
+void st7789_fill_color(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t color);
+void st7789_write_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg_color ,const font_t *font);
+void st7789_draw_image(uint16_t x, uint16_t y, const image_t *image);
+
+
+#endif
+
+// ==========================================
+// --- driver/esp32/esp_at.h ---
+// ==========================================
+#ifndef __ESP_AT__
+#define __ESP_AT__
+
+#include <stdbool.h>
+#define ESP_AT_DEBUG	1
+#define ARRAY_SIZE(arr)	sizeof(arr) / sizeof((arr)[0])
+
+typedef struct
+{
+	char ssid[32];
+    char bssid[18];
+    int channel;
+    int rssi;
+    bool connected;
+}esp_wifi_info_t;
+
+typedef struct
+{
+	uint16_t year;
+	uint8_t  month;
+	uint8_t  day;
+	uint8_t  hour;
+	uint8_t  minute;
+	uint8_t  second;
+	uint8_t  weekday;
+}esp_date_time_t;
+
+bool esp_at_init(void);
+bool esp_at_wifi_init(void);
+bool esp_at_connect_wifi(const char *ssid, const char *pwd, const char *mac);
+bool esp_at_get_wifi_info(esp_wifi_info_t *info);
+bool wifi_is_connected(void);
+bool esp_at_sntp_init(void);
+bool esp_at_sntp_get_time(esp_date_time_t *date);
+const char *esp_at_http_get(const char *url);
+
+
+#endif /*__ESP_AT__*/
+
+// ==========================================
+// --- driver/rtc/rtc.h ---
+// ==========================================
+#ifndef __RTC_H__
+#define __RTC_H__
+
+typedef struct
+{
+	uint16_t year;
+	uint8_t  month;
+	uint8_t  day;
+	uint8_t  hour;
+	uint8_t  minute;
+	uint8_t  second;
+	uint8_t  weekday;
+}rtc_date_time_t;
+
+void rtc_init(void);
+void rtc_set_time(const rtc_date_time_t *date_time);
+void rtc_get_time(rtc_date_time_t *date_time);
+
+#endif /*__RTC_H__*/
+
+// ==========================================
+// --- driver/tim_delay/tim_delay.h ---
+// ==========================================
+#ifndef __TIM_DELAY_H__
+#define __TIM_DELAY_H__
+
+typedef void (*tim_periodic_callback_t)(void);
+
+void tim_delay_init(void);
+uint64_t tim_now(void);
+uint64_t tim_get_us(void);
+uint64_t tim_get_ms(void);
+void tim_delay_us(uint32_t us);
+void tim_delay_ms(uint32_t ms);
+void tim_register_periodic_callback(tim_periodic_callback_t callback);
+
+#endif
+
+// ==========================================
+// --- driver/console/console.h ---
+// ==========================================
+#ifndef __CONSOLE_H__
+#define __CONSOLE_H__
+
+typedef void (*console_received_func_t)(uint8_t data);
+
+void console_init(void);
+void console_write(const char str[]);
+void console_received_register(console_received_func_t func);
+
+#endif /*__CONSOLE_H__*/
+
+// ==========================================
+// --- app/workqueue.h ---
+// ==========================================
+#ifndef __WORKQUEUE_H__
+#define __WORKQUEUE_H__
+
+typedef void (*work_t)(void *param);
+
+void workqueue_init(void);
+void workqueue_run(work_t work, void *param);
+
+#endif /*__WORKQUEUE_H__*/
+
+// ==========================================
+// --- app/weather.h ---
+// ==========================================
+#ifndef __WEATHER__
+#define __WEATHER__
+
+#include <stdint.h>
+#include <stdbool.h>
+
+typedef struct
+{
+    char city[32];
+    char location[128];
+    char weather[16];
+    int weather_code;
+    float temperature;
+} weather_info_t;
+
+bool parse_seniverse_response(const char *response, weather_info_t *info);
+
+#endif /*__WEATHER__*/
+
+// ==========================================
+// --- app/wifi.h ---
+// ==========================================
+#ifndef __WIFI_H__
+#define __WIFI_H__
+
+#define WIFI_SSID	"iPhone18promax"
+#define WIFI_PASSWD	"77889900"
+
+void wifi_init(void);
+void wifi_wait_connect(void);
+
+#endif /*__WIFI_H__*/
+
+// ==========================================
+// --- app/ui.h ---
+// ==========================================
+#ifndef __UI_H__
+#define __UI_H__
+
+#include <stdint.h>
+#include "font.h"
+#include "image.h"
+
+#define UI_WIDTH 240
+#define UI_HEIGHT 320
+
+/*红色占8位只需要5位所以前3位是0xF8，绿色占8位只需要6位所以前2位是0xFC，蓝色占8位只需要5位所以直接取前5位，直接舍弃后3位，然后组合成16位，前11位是红色，中6位是绿色，后5位是蓝色*/
+#define mkcolor(r,g,b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >>3))	//把8位RGB颜色值转换为16位RGB565格式
+
+
+void ui_init(void);
+void ui_fill_color(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t color);
+void ui_write_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg_color ,const font_t *font);
+void ui_draw_image(uint16_t x, uint16_t y, const image_t *image);
+
+
+#endif /*__UI_H__*/
+
+// ==========================================
+// --- app/app.h ---
+// ==========================================
+#ifndef __APP_H__
+#define __APP_H__
+
+#define APP_VERSION "_v1.0"
+
+
+void app_init(void);
+
+#endif /*__APP_H__*/
+
+// ==========================================
+// --- app/board.h ---
+// ==========================================
+#ifndef __BOARD_H__
+#define __BOARD_H__
+
+#include <stdio.h>
+
+void board_lowlevel_init(void);
+void board_init(void);
+int fputc(int ch, FILE *f);
+
+#endif /*__BOARD_H__*/
+
+// ==========================================
+// --- app/page/page.h ---
+// ==========================================
+#ifndef __PAGE_H__
+#define __PAGE_H__
+
+#include "rtc.h"
+
+void welcome_page_display(void);
+void error_page_display(const char *msg);
+void wifi_page_display(void);
+void main_page_display(void);
+void main_page_redraw_wifi_ssid(const char *ssid);
+void main_page_redraw_time(rtc_date_time_t *time);
+void main_page_redraw_date(rtc_date_time_t *date);
+void main_page_redraw_inner_temperature(const float temperature);
+void main_page_redraw_inner_humidity(const float humidity);
+void main_page_redraw_outdoor_city(const char *city);
+void main_page_redraw_outdoor_temperature(const float temperature);
+void main_page_redraw_outdoor_weather_icon(const int code);
+
+#endif /*__PAGE_H__*/
+
+// ==========================================
+// --- app/font/font.h ---
+// ==========================================
+#ifndef _FONT_H_
+#define _FONT_H_
+
+#include <stdint.h>
+
+typedef struct
+{
+	const char *name;
+	const uint8_t *model;
+} font_chinese_t;
+
+
+typedef struct
+{
+	uint16_t size;
+	const uint8_t *ascii_model;
+	const char *ascii_map;
+	const font_chinese_t *chinese;
+} font_t;
+
+extern const font_t font76_maple_bold;
+extern const font_t font32_maple_bold;
+extern const font_t font24_maple_bold;
+extern const font_t font20_maple_bold;
+extern const font_t font16_maple_bold;
+extern const font_t font54_maple_bold;
+extern const font_t font54_maple_semibold;
+extern const font_t font64_maple_extrabold;
+
+#endif /*_FONT_H_*/
+
+// ==========================================
+// --- app/image/image.h ---
+// ==========================================
+#ifndef __IMAGE_H__
+#define __IMAGE_H__
+
+#include <stdint.h>
+
+typedef struct{
+	uint16_t width;
+	uint16_t height;
+	const uint8_t *data;
+} image_t;
+
+extern const image_t image_meihua;
+extern const image_t image_error;
+extern const image_t image_wifi;
+extern const image_t image_icon_wifi;
+extern const image_t image_icon_na;
+extern const image_t image_duoyun;
+extern const image_t image_leizhenyu;
+extern const image_t image_qing;
+extern const image_t image_wenduji;
+extern const image_t image_yintian;
+extern const image_t image_yueliang;
+extern const image_t image_zhongxue;
+extern const image_t image_zhongyu;
+
+#endif /*__IMAGE_H__*/

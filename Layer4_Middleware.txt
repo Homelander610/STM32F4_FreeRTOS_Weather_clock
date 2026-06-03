@@ -1,0 +1,167 @@
+// ==========================================
+// --- workqueue.c ---
+// ==========================================
+#include <stdint.h>
+#include <stdio.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "workqueue.h"
+
+typedef struct
+{
+    work_t work;
+    void *param;
+} work_message_t;
+
+static QueueHandle_t work_msg_queue;
+
+static void work_func(void *param)
+{
+    work_message_t msg;
+    while (1)
+    {
+        xQueueReceive(work_msg_queue, &msg, portMAX_DELAY);
+        msg.work(msg.param);
+    }
+}
+
+void workqueue_init(void)
+{
+    work_msg_queue = xQueueCreate(16, sizeof(work_message_t));
+    configASSERT(work_msg_queue);
+    xTaskCreate(work_func, "workqueue", 1024, NULL, 5, NULL);
+}
+
+void workqueue_run(work_t work, void *param)
+{
+    configASSERT(work_msg_queue); // 防止workqueue_run在workqueue_init之前被调用，导致线程不安全
+    work_message_t msg = {work, param};
+    if (xQueueSend(work_msg_queue, &msg, 0) != pdPASS)
+    {
+        // 队列满 任务被丢弃 通常通过串口打印警告
+        printf("[WARNING] Workqueue full! Task dropped.\n");
+    }
+}
+
+// ==========================================
+// --- weather.c ---
+// ==========================================
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include "weather.h"
+
+bool parse_seniverse_response(const char *response, weather_info_t *info)
+{
+    response = strstr(response, "\"results\":");
+    if (response == NULL)
+        return false;
+
+    const char *location_response = strstr(response, "\"location\":");
+    if (location_response == NULL)
+        return false;
+
+    const char *location_name_response = strstr(location_response, "\"name\":");
+    if (location_name_response)
+    {
+        sscanf(location_name_response, "\"name\":\"%31[^\"]\"", info->city);
+    }
+    const char *location_path_response = strstr(location_response, "\"path\":");
+    if (location_path_response)
+    {
+        sscanf(location_path_response, "\"path\":\"%127[^\"]\"", info->location);
+    }
+
+    const char *now_response = strstr(response, "\"now\":");
+    if (now_response == NULL)
+        return false;
+
+    const char *now_text_response = strstr(now_response, "\"text\":");
+    if (now_text_response)
+    {
+        sscanf(now_text_response, "\"text\":\"%15[^\"]\"", info->weather);
+    }
+    const char *now_code_response = strstr(now_response, "\"code\":");
+    if (now_code_response)
+    {
+        sscanf(now_code_response, "\"code\":\"%d\"", &info->weather_code);
+    }
+    // 单片机不支持float类型
+    char temperature_str[16] = {0};
+    const char *now_temperature_response = strstr(now_response, "\"temperature\":");
+    if (now_temperature_response)
+    {
+        if (sscanf(now_temperature_response, "\"temperature\":\"%15[^\"]\"", temperature_str) == 1)
+            info->temperature = atof(temperature_str);
+    }
+
+    return true;
+}
+
+// ==========================================
+// --- wifi.c ---
+// ==========================================
+#include <stdio.h>
+#include <stdint.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "esp_at.h"
+#include "page.h"
+#include "wifi.h"
+
+void wifi_init(void)
+{
+	if (!esp_at_init())
+	{
+		printf("[AT] init failed\n");
+		goto err;
+	}
+	printf("[AT] inited\n");
+
+	if (!esp_at_wifi_init())
+	{
+		printf("[WIFI] init failed\n");
+		goto err;
+	}
+	printf("[WIFI] inited\n");
+
+	if (!esp_at_sntp_init())
+	{
+		printf("[SNTP] init failed\n");
+		goto err;
+	}
+	printf("[SNTP] inited\n");
+	return;
+err:
+	error_page_display("wireless init failed");
+	while (1)
+	{
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
+}
+
+void wifi_wait_connect(void)
+{
+	printf("[WIFI] connecting\n");
+	esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWD, NULL);
+
+	for (uint32_t t = 0; t < 10 * 1000; t += 100)
+	{
+		vTaskDelay(pdMS_TO_TICKS(100));
+		esp_wifi_info_t wifi = {0};
+		if (esp_at_get_wifi_info(&wifi) && wifi.connected)
+		{
+			printf("[WIFI] Connected\n");
+			printf("[WIFI] SSID: %s, BSSID: %s, Channel: %d, RSSI: %d\n", wifi.ssid, wifi.bssid, wifi.channel, wifi.rssi);
+			return;
+		}
+	}
+	printf("[WIFI] Connectiong Timeout\n");
+	error_page_display("wireless connect failed");
+	while (1)
+	{
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
+}
